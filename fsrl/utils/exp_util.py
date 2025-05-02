@@ -56,7 +56,7 @@ def get_cfg_value(config, key):
                 return res
     return "None"
 
-
+#TODO: ADD NAMED CHECKPOINTS
 def load_config_and_model(path: str, best: bool = False):
     """
     Load the configuration and trained model from a specified directory.
