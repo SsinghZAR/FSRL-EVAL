@@ -59,6 +59,7 @@ class CPO(BasePolicy):
         (default: None)
     :param Optional[torch.optim.lr_scheduler.LambdaLR] lr_scheduler: learning rate
         scheduler for the optimizer. (default: None)
+    :param bool is_discrete: whether the action space is discrete. (default: False)
 
     .. seealso::
 
@@ -93,7 +94,7 @@ class CPO(BasePolicy):
         observation_space: Optional[gym.Space] = None,
         action_space: Optional[gym.Space] = None,
         lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
-        is_discrete: bool = False
+        is_discrete: bool = False,
     ) -> None:
         super().__init__(
             actor, critics, dist_fn, logger, gamma, max_batchsize, reward_normalization,
