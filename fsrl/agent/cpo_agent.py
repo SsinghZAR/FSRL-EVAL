@@ -1,13 +1,15 @@
 from typing import List, Optional, Tuple, Union
 
 import gymnasium as gym
+from gymnasium.spaces import Discrete
 import numpy as np
 import torch
 import torch.nn as nn
 from tianshou.env import BaseVectorEnv
 from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, Critic
-from torch.distributions import Independent, Normal
+from tianshou.utils.net.discrete import Actor as DiscreteActor
+from torch.distributions import Independent, Normal, Categorical
 
 from fsrl.agent import OnpolicyAgent
 from fsrl.policy import CPO
@@ -116,27 +118,58 @@ class CPOAgent(OnpolicyAgent):
         # model
         state_shape = env.observation_space.shape or env.observation_space.n
         action_shape = env.action_space.shape or env.action_space.n
-        max_action = env.action_space.high[0]
+        
+        # Check if action space is discrete or continuous
+        if isinstance(env.action_space, Discrete):
+            # For discrete action spaces, we don't need max_action
+            max_action = 1.0  # Dummy value, not used by DiscreteActor
+            is_discrete = True
+        else:
+            # For continuous action spaces, get the max_action from the action space
+            try:
+                max_action = env.action_space.high[0]
+            except AttributeError:
+                 raise AttributeError("Cannot get high attribute from action space. Is it a Box space?")
+            is_discrete = False
 
         net = Net(state_shape, hidden_sizes=hidden_sizes, device=device)
-        actor = ActorProb(
-            net, action_shape, max_action=max_action, unbounded=unbounded, device=device
-        ).to(device)
+        
+        # Create appropriate actor based on action space type
+        if is_discrete:
+            actor = DiscreteActor(
+                net, action_shape, device=device
+            ).to(device)
+            # Discrete action distribution
+            def dist(logits):
+                return torch.distributions.Categorical(logits=logits)
+        else:
+            actor = ActorProb(
+                net, action_shape, max_action=max_action, unbounded=unbounded, device=device
+            ).to(device)
+            # Continuous action distribution
+            def dist(*logits):
+                return Independent(Normal(*logits), 1)
+
         critic = [
             Critic(
                 Net(state_shape, hidden_sizes=hidden_sizes, device=device),
                 device=device
-            ).to(device) for _ in range(2)
+            ).to(device) for _ in range(2) # CPO needs 2 critics: reward and cost
         ]
 
-        torch.nn.init.constant_(actor.sigma_param, -0.5)
+        # Only apply sigma_param initialization for continuous action spaces with ActorProb
+        if not is_discrete:
+            torch.nn.init.constant_(actor.sigma_param, -0.5)
+            
         actor_critic = ActorCritic(actor, critic)
         # orthogonal initialization
         for m in actor_critic.modules():
             if isinstance(m, torch.nn.Linear):
                 torch.nn.init.orthogonal_(m.weight)
                 torch.nn.init.zeros_(m.bias)
-        if last_layer_scale:
+        
+        # Only apply last_layer_scale for continuous action spaces
+        if last_layer_scale and not is_discrete:
             # do last policy layer scaling, this will make initial actions have (close
             # to) 0 mean and std, and will help boost performances, see
             # https://arxiv.org/abs/2006.05990, Fig.24 for details
@@ -144,13 +177,13 @@ class CPOAgent(OnpolicyAgent):
                 if isinstance(m, torch.nn.Linear):
                     torch.nn.init.zeros_(m.bias)
                     m.weight.data.copy_(0.01 * m.weight.data)
-        # optim = torch.optim.Adam(actor_critic.parameters(), lr=lr)
+        
+        # optim for critic only
         optim = torch.optim.Adam(nn.ModuleList(critic).parameters(), lr=lr)
 
-        # replace DiagGuassian with Independent(Normal) which is equivalent pass *logits
-        # to be consistent with policy.forward
-        def dist(*logits):
-            return Independent(Normal(*logits), 1)
+        # remove DiagGuassian comment as it's handled by dist function definition
+        # def dist(*logits):
+        #     return Independent(Normal(*logits), 1)
 
         self.policy = CPO(
             actor,
@@ -177,7 +210,8 @@ class CPOAgent(OnpolicyAgent):
             action_bound_method=action_bound_method,
             observation_space=env.observation_space,
             action_space=env.action_space,
-            lr_scheduler=lr_scheduler
+            lr_scheduler=lr_scheduler,
+            is_discrete=is_discrete
         )
 
     def learn(

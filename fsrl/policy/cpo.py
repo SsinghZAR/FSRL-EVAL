@@ -2,6 +2,7 @@ from argparse import Action
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import gymnasium as gym
+from gymnasium.spaces import Discrete
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -91,13 +92,15 @@ class CPO(BasePolicy):
         action_bound_method: str = "clip",
         observation_space: Optional[gym.Space] = None,
         action_space: Optional[gym.Space] = None,
-        lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
+        lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
+        is_discrete: bool = False
     ) -> None:
         super().__init__(
             actor, critics, dist_fn, logger, gamma, max_batchsize, reward_normalization,
             deterministic_eval, action_scaling, action_bound_method, observation_space,
             action_space, lr_scheduler
         )
+        self.is_discrete = is_discrete
         self.optim = optim
         self._cost_limit = cost_limit
         self._lambda = gae_lambda
@@ -130,18 +133,28 @@ class CPO(BasePolicy):
                 mean, std = adv.mean(), adv.std()
                 batch.advs[..., i] = (adv - mean) / std
         batch.act = to_torch_as(batch.act, batch.values[..., 0])
-        old_log_prob, old_mean, old_std = [], [], []
+        old_log_prob = []
+        if self.is_discrete:
+            old_logits = []
+        else:
+            old_mean, old_std = [], []
         with torch.no_grad():
             for minibatch in batch.split(
                 self._max_batchsize, shuffle=False, merge_last=True
             ):
                 res = self.forward(minibatch)
                 old_log_prob.append(res.dist.log_prob(minibatch.act))
-                old_mean.append(res.logits[0, ...])
-                old_std.append(res.logits[1, ...])
+                if self.is_discrete:
+                    old_logits.append(res.logits)
+                else:
+                    old_mean.append(res.logits[0])
+                    old_std.append(res.logits[1])
         batch.logp_old = torch.cat(old_log_prob, dim=0)
-        batch.mean_old = torch.cat(old_mean, dim=0)
-        batch.std_old = torch.cat(old_std, dim=0)
+        if self.is_discrete:
+            batch.logits_old = torch.cat(old_logits, dim=0)
+        else:
+            batch.mean_old = torch.cat(old_mean, dim=0)
+            batch.std_old = torch.cat(old_std, dim=0)
         return batch
 
     def critics_loss(self, minibatch: Batch) -> Tuple[torch.Tensor, dict]:
@@ -239,7 +252,10 @@ class CPO(BasePolicy):
         ent = dist.entropy().mean()
         logp = dist.log_prob(minibatch.act)
 
-        dist_old = self.dist_fn(*(minibatch.mean_old, minibatch.std_old))  # type: ignore
+        if self.is_discrete:
+            dist_old = self.dist_fn(minibatch.logits_old)
+        else:
+            dist_old = self.dist_fn(*(minibatch.mean_old, minibatch.std_old))
         kl = kl_divergence(dist_old, dist).mean()
 
         objective = self._get_objective(logp, minibatch.logp_old, minibatch.advs[..., 0])
