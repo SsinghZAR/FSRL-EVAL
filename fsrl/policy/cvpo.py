@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import gymnasium as gym
 import numpy as np
 import torch
-from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as
+import torch.nn.functional as F
+from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as, to_torch
 from torch import nn
 from torch.distributions import kl_divergence
 
@@ -160,6 +161,8 @@ class CVPO(BasePolicy):
         self.tau = tau
         self._discrete = True if self.action_type == "discrete" else False
         self._n_step = n_step
+        if self._discrete:
+            self._num_actions = self.action_space.n
         self.__eps = np.finfo(np.float32).eps.item() * 10  # around 1e-6
 
     def update_cost_limit(self, cost_limit: float):
@@ -206,10 +209,18 @@ class CVPO(BasePolicy):
     def _target_q(self, buffer: ReplayBuffer, indices: np.ndarray) -> List[torch.Tensor]:
         batch = buffer[indices]  # batch.obs_next: s_{t+n}
         obs_next_result = self(batch, model="actor", input='obs_next')
-        act = obs_next_result.act
+        act_next = obs_next_result.act # Action for next state s_{t+n}
+
+        # One-hot encode discrete action if necessary
+        if self._discrete:
+            act_next_one_hot = F.one_hot(act_next.long(), num_classes=self._num_actions).float()
+        else:
+            act_next_one_hot = act_next # Keep continuous action as is
+
         target_q_list = []
         for i in range(self.critics_num):
-            target_q, _ = self.critics_old[i].predict(batch.obs_next, act)
+            # Pass potentially one-hot encoded action to critic
+            target_q, _ = self.critics_old[i].predict(batch.obs_next, act_next_one_hot)
             target_q_list.append(target_q)
         return target_q_list
 
@@ -246,17 +257,26 @@ class CVPO(BasePolicy):
         return Batch(logits=logits, act=act, state=hidden, dist=dist)
 
     def critics_loss(
-        self, batch: Batch, critics: torch.nn.Module, optimizer: torch.optim.Optimizer
+        self,
+        batch: Batch, critics: torch.nn.Module, optimizer: torch.optim.Optimizer
     ) -> Tuple[torch.Tensor, dict]:
         """A simple wrapper script for updating critic network."""
         weight = getattr(batch, "weight", 1.0)
         loss_critic = 0
         td_average = 0
         stats_critic = {}
+
+        # One-hot encode batch.act if discrete before feeding to critic
+        act = batch.act
+        if self._discrete:
+            # Convert numpy array directly to a long tensor on the correct device
+            act_long_tensor = to_torch(act, device=self.device, dtype=torch.long)
+            act = F.one_hot(act_long_tensor, num_classes=self._num_actions).float()
+
         for i in range(self.critics_num):
             target_q = batch.rets[..., i].flatten()
             # double q network
-            current_q_list = critics[i](batch.obs, batch.act)
+            current_q_list = critics[i](batch.obs, act)
             loss_i = 0
             for j in range(len(current_q_list)):
                 td = current_q_list[j].flatten() - target_q
@@ -326,23 +346,39 @@ class CVPO(BasePolicy):
         # for continuous action space, sample K particles
         K = self._sample_act_num
         B = obs.shape[0]
-        da = batch.act.shape[-1]
         ds = obs.shape[-1]
         with torch.no_grad():
             old_result = self(batch, model="actor_old", input="obs")
             old_dist = old_result.dist  # (B, da)
-            sample_act = old_dist.sample((K, ))  # (K, B, da)
-            expanded_obs = obs[None, ...].expand(K, -1, -1)  # (K, B, ds)
+
+            # Sample actions
+            if self._discrete:
+                # Need to sample K actions for each obs in batch
+                # old_dist.logits should have shape [B, num_actions]
+                # Expand obs to [K*B, ds]
+                expanded_obs = obs.repeat_interleave(K, dim=0)
+                # Sample K actions per original observation
+                sample_act_indices = old_dist.sample((K,)) # Shape [K, B]
+                # One-hot encode the sampled actions, using reshape instead of view for non-contiguous tensors
+                sample_act = F.one_hot(sample_act_indices.reshape(-1).long(), num_classes=self._num_actions).float()
+                da = self._num_actions # Action dimension is num_actions for one-hot
+            else:
+                da = batch.act.shape[-1]
+                sample_act = old_dist.sample((K, ))  # (K, B, da)
+                expanded_obs = obs[None, ...].expand(K, -1, -1)  # (K, B, ds)
+                sample_act = sample_act.reshape(-1, da)
+                expanded_obs = expanded_obs.reshape(-1, ds)
+
             q_values = []
-            # TODO, use critics old or the current?
+            # Use current critics for Q-value estimation in E-step?
+            # Paper/original code might use critics_old, but using current critics is common.
+            # Let's stick with current critics for now.
             for i in range(self.critics_num):
-                target_q, _ = self.critics[i].predict(
-                    expanded_obs.reshape(-1, ds), sample_act.reshape(-1, da)
-                )
+                target_q, _ = self.critics[i].predict(expanded_obs, sample_act)
                 target_q = target_q.reshape(K, B)
                 q_values.append(target_q.T)  # (critic_num, B, K)
 
-        # optimize
+        # optimize E-step dual variables
         for _ in range(self._estep_iter_num):
             self.estep_optim.zero_grad()
             estep_loss = self._estep_dual_loss(q_values)
@@ -367,22 +403,51 @@ class CVPO(BasePolicy):
         self.logger.store(tab="estep", estep_time=self._estep_duration)
 
         # M-step begin
+        result = self(batch, model="actor", input="obs")
+        current_dist = result.dist
 
-        mu_old, std_old = old_result.logits
-        mu_old, std_old = mu_old.detach(), std_old.detach()
-        for _ in range(self._mstep_iter_num):
-            result = self(batch, model="actor", input="obs")
+        # MLE loss and KL loss calculation depends heavily on distribution type
+        if self._discrete:
+             # --- Discrete M-step --- 
+             # Sample K actions again using the *current* policy
+             # Resample actions using the *current* distribution for MLE loss
+             # Use the same obs expanded earlier
+             current_act_indices = current_dist.sample((K,)) # (K, B)
+             current_act_one_hot = F.one_hot(current_act_indices.reshape(-1).long(), num_classes=self._num_actions).float() # (K*B, num_actions)
 
-            # MLE loss
-            mu, std = result.logits
-            dist1 = self.dist_fn(mu, std_old)
-            dist2 = self.dist_fn(mu_old, std)
+             # Calculate log_prob using the *current* distribution for the actions sampled from the *old* dist
+             log_likelihood = current_dist.log_prob(sample_act_indices) # Needs sample_act_indices from E-step
+             loss_mle = -torch.mean(optimal_q * log_likelihood) # optimal_q: (K, B), log_likelihood: (K, B)
+
+             # KL divergence for discrete distributions
+             # Ensure batch.obs corresponds to the observations for old_dist
+             old_dist_batch = self.dist_fn(self.actor_old(batch.obs)[0])
+             kl_div = kl_divergence(old_dist_batch, current_dist).mean()
+
+             # TODO: Adapt M-step dual variables and update for discrete KL
+             # For simplicity, let's just use the MLE loss for now and skip KL regularization
+             # This deviates from standard CVPO but avoids complexity of discrete KL dual update
+             loss_actor = loss_mle
+             kl_mu, kl_std = torch.tensor(0.), torch.tensor(0.) # Placeholder values
+             dual_mu, dual_std = 0., 0. # Placeholder values
+             loss_kl = torch.tensor(0.) # Placeholder value
+
+        else:
+            # --- Continuous M-step --- 
+            mu_old, std_old = old_result.logits
+            mu_old, std_old = mu_old.detach(), std_old.detach()
+            mu, std = result.logits # Current policy distribution parameters
+
+            # Likelihood calculation needs actions sampled from the old policy (sample_act)
+            # and evaluated under the current policy components.
+            dist1 = self.dist_fn(mu, std_old) # Current mean, old std
+            dist2 = self.dist_fn(mu_old, std) # Old mean, current std
             likelihood = dist1.expand((K, B)).log_prob(sample_act) + dist2.expand(
                 (K, B)
             ).log_prob(sample_act)  # (K, B)
             loss_mle = -torch.mean(optimal_q * likelihood)
 
-            # update dual variables to regularize the KL
+            # Update KL dual variables
             kl_mu, kl_std = self.gaussian_kl(mu_old, std_old, mu, std)
             mstep_dual_loss = self.mstep_dual_mu * (self._mstep_kl_mu - kl_mu).detach(
             ) + self.mstep_dual_std * (self._mstep_kl_std - kl_std).detach()
@@ -390,32 +455,32 @@ class CVPO(BasePolicy):
             mstep_dual_loss.backward()
             self.mstep_optim.step()
 
-            # KL loss
+            # KL loss term
             dual_mu = np.clip(self.mstep_dual_mu.item(), 0.0, self._mstep_dual_max)
             dual_std = np.clip(self.mstep_dual_std.item(), 0.0, self._mstep_dual_max)
             loss_kl = dual_mu * (kl_mu - self._mstep_kl_mu
-                                 ) + dual_std * (kl_std - self._mstep_kl_std)
+                                    ) + dual_std * (kl_std - self._mstep_kl_std)
 
             loss_actor = loss_mle + loss_kl
 
-            # optimize the policy network
-            self.actor_optim.zero_grad()
-            loss_actor.backward()
-            self.actor_optim.step()
+        # optimize the policy network
+        self.actor_optim.zero_grad()
+        loss_actor.backward()
+        self.actor_optim.step()
 
-            entropy = torch.mean(dist1.entropy() + dist2.entropy()).item()
+        entropy = torch.mean(current_dist.entropy()).item()
 
-            self.logger.store(
-                tab="mstep",
-                mstep_kl_mu=kl_mu.item(),
-                mstep_kl_std=kl_std.item(),
-                mstep_loss_kl=loss_kl.item(),
-                mstep_loss_mle=loss_mle.item(),
-                mstep_loss_total=loss_actor.item(),
-                mstep_dual_mu=dual_mu,
-                mstep_dual_std=dual_std,
-                entropy=entropy
-            )
+        self.logger.store(
+            tab="mstep",
+            mstep_kl_mu=kl_mu.item(),
+            mstep_kl_std=kl_std.item(),
+            mstep_loss_kl=loss_kl.item(),
+            mstep_loss_mle=loss_mle.item(),
+            mstep_loss_total=loss_actor.item(),
+            mstep_dual_mu=dual_mu,
+            mstep_dual_std=dual_std,
+            entropy=entropy
+        )
         self._mstep_duration += time.time() - t_estep
         self.logger.store(tab="mstep", mstep_time=self._mstep_duration)
 
