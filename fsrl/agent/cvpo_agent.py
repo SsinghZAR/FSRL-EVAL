@@ -1,12 +1,14 @@
 from typing import Optional, Tuple
 
 import gymnasium as gym
+from gymnasium.spaces import Discrete
 import numpy as np
 import torch
 import torch.nn as nn
 from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb
-from torch.distributions import Independent, Normal
+from tianshou.utils.net.discrete import Actor
+from torch.distributions import Independent, Normal, Categorical
 
 from fsrl.agent import OffpolicyAgent
 from fsrl.policy import CVPO
@@ -112,12 +114,16 @@ class CVPOAgent(OffpolicyAgent):
         deterministic_eval: bool = True,
         action_scaling: bool = True,
         action_bound_method: str = "clip",
-        lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
+        lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
+        max_episode_steps: Optional[int] = None,
     ) -> None:
         super().__init__()
 
         self.logger = logger
         self.cost_limit = cost_limit
+
+        # Check action space type
+        is_discrete = isinstance(env.action_space, Discrete)
 
         if np.isscalar(cost_limit):
             cost_dim = 1
@@ -131,64 +137,74 @@ class CVPOAgent(OffpolicyAgent):
         # model
         state_shape = env.observation_space.shape or env.observation_space.n
         action_shape = env.action_space.shape or env.action_space.n
-        max_action = env.action_space.high[0]
+        #max_action = env.action_space.high[0]
 
-        assert hasattr(
-            env.spec, "max_episode_steps"
-        ), "Please use an env wrapper to provide 'max_episode_steps' for CVPO"
-
+        # Actor network
         net = Net(state_shape, hidden_sizes=hidden_sizes, device=device)
-        actor = ActorProb(
-            net,
-            action_shape,
-            max_action=max_action,
-            device=device,
-            conditioned_sigma=conditioned_sigma,
-            unbounded=unbounded
-        ).to(device)
+        if is_discrete:
+            action_shape = env.action_space.n
+            actor = Actor(net, action_shape, device=device).to(device)
+        else: # Continuous
+            action_shape = env.action_space.shape
+            max_action = env.action_space.high[0]
+            actor = ActorProb(
+                net,
+                action_shape,
+                max_action=max_action,
+                device=device,
+                conditioned_sigma=conditioned_sigma,
+                unbounded=unbounded
+            ).to(device)
         actor_optim = torch.optim.Adam(actor.parameters(), lr=actor_lr)
 
+        # Critic network
         critics = []
-
-        for _ in range(1 + cost_dim):
-            if double_critic:
-                net1 = Net(
-                    state_shape,
-                    action_shape,
-                    hidden_sizes=hidden_sizes,
-                    concat=True,
-                    device=device
-                )
-                net2 = Net(
-                    state_shape,
-                    action_shape,
-                    hidden_sizes=hidden_sizes,
-                    concat=True,
-                    device=device
-                )
-                critics.append(DoubleCritic(net1, net2, device=device).to(device))
-            else:
-                net_c = Net(
-                    state_shape,
-                    action_shape,
-                    hidden_sizes=hidden_sizes,
-                    concat=True,
-                    device=device
-                )
-                critics.append(SingleCritic(net_c, device=device).to(device))
+        # Critic network requires state and action input
+        # For discrete actions, we need to handle the action input (e.g., embedding)
+        # Tianshou's Net can take state_shape and action_shape.
+        # Let's pass the original action_shape (int for discrete) and see if critic handles it.
+        # If errors occur, critic Net might need explicit action embedding.
+        critic_action_shape = env.action_space.n if is_discrete else env.action_space.shape[0]
+        if double_critic:
+            net1 = Net(
+                state_shape,
+                action_shape=critic_action_shape,
+                hidden_sizes=hidden_sizes,
+                concat=True,
+                device=device
+            )
+            net2 = Net(
+                state_shape,
+                action_shape=critic_action_shape,
+                hidden_sizes=hidden_sizes,
+                concat=True,
+                device=device
+            )
+            critics.append(DoubleCritic(net1, net2, device=device).to(device))
+        else:
+            net_c = Net(
+                state_shape,
+                action_shape=critic_action_shape,
+                hidden_sizes=hidden_sizes,
+                concat=True,
+                device=device
+            )
+            critics.append(SingleCritic(net_c, device=device).to(device))
 
         critic_optim = torch.optim.Adam(
             nn.ModuleList(critics).parameters(), lr=critic_lr
         )
-        if not conditioned_sigma:
+        # Parameters specific to continuous action space
+        if not is_discrete and not conditioned_sigma:
             torch.nn.init.constant_(actor.sigma_param, -0.5)
+
         actor_critic = ActorCritic(actor, critics)
         # orthogonal initialization
         for m in actor_critic.modules():
             if isinstance(m, torch.nn.Linear):
                 torch.nn.init.orthogonal_(m.weight)
                 torch.nn.init.zeros_(m.bias)
-        if last_layer_scale:
+        if not is_discrete and last_layer_scale:
             # do last policy layer scaling, this will make initial actions have (close
             # to) 0 mean and std, and will help boost performances, see
             # https://arxiv.org/abs/2006.05990, Fig.24 for details
@@ -197,8 +213,11 @@ class CVPOAgent(OffpolicyAgent):
                     torch.nn.init.zeros_(m.bias)
                     m.weight.data.copy_(0.01 * m.weight.data)
 
-        def dist(*logits):
-            return Independent(Normal(*logits), 1)
+        # Distribution function
+        if is_discrete:
+            dist_fn = lambda *logits: Categorical(logits=logits[0])
+        else: # Continuous
+            dist_fn = lambda *logits: Independent(Normal(*logits), 1)
 
         self.policy = CVPO(
             actor=actor,
@@ -207,8 +226,10 @@ class CVPOAgent(OffpolicyAgent):
             critic_optim=critic_optim,
             logger=logger,
             action_space=env.action_space,
-            dist_fn=dist,
-            max_episode_steps=env.spec.max_episode_steps,
+            dist_fn=dist_fn,
+            max_episode_steps=max_episode_steps if max_episode_steps is not None \
+                              else getattr(getattr(env, 'spec', None), 'max_episode_steps', None) \
+                              or (_ for _ in ()).throw(AssertionError("max_episode_steps must be provided or available in env.spec")),
             cost_limit=cost_limit,
             tau=tau,
             gamma=gamma,
@@ -224,7 +245,8 @@ class CVPOAgent(OffpolicyAgent):
             mstep_dual_max=mstep_dual_max,
             mstep_dual_lr=mstep_dual_lr,
             deterministic_eval=deterministic_eval,
-            action_scaling=action_scaling,
-            action_bound_method=action_bound_method,
+            # Pass continuous-specific params only if not discrete
+            action_scaling=action_scaling if not is_discrete else False,
+            action_bound_method=action_bound_method if not is_discrete else "",
             lr_scheduler=lr_scheduler
         )

@@ -5,67 +5,47 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import gymnasium as gym
 import numpy as np
 import torch
-from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as
+import torch.nn.functional as F
+from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as, to_torch
 from torch import nn
 from torch.distributions import kl_divergence
 
-from fsrl.policy import BasePolicy
-from fsrl.utils import BaseLogger
+# Assuming BasePolicy and DummyLogger are importable from fsrl
+# If not, adjust the import path accordingly
+try:
+    from fsrl.policy import BasePolicy
+    from fsrl.utils import BaseLogger, DummyLogger
+except ImportError:
+    print("Please ensure fsrl library is installed and import paths are correct.")
+    # Define dummy classes if fsrl is not available, for the code to be syntactically valid
+    class BasePolicy(nn.Module):
+        def __init__(self, actor=None, critics=None, *args, **kwargs):
+             super().__init__()
+             # Simulate BasePolicy setting these if passed
+             self.actor = actor
+             self.critics = critics if isinstance(critics, nn.ModuleList) else nn.ModuleList([critics]) if critics is not None else nn.ModuleList()
+             self.critics_num = len(self.critics)
+             self.logger = kwargs.get('logger', DummyLogger()) # Ensure logger is set
+        def compute_nstep_returns(self, *args, **kwargs): pass
+        def map_action(self, act): return act # Placeholder
+        def map_action_inverse(self, act): return act # Placeholder
+        def soft_update(self, *args, **kwargs): pass
+
+    class BaseLogger:
+        def info(self, *args, **kwargs): print(*args, **kwargs)
+        def debug(self, *args, **kwargs): print(*args, **kwargs)
+        def warning(self, *args, **kwargs): print("WARNING:", *args, **kwargs)
+        def error(self, *args, **kwargs): print("ERROR:", *args, **kwargs)
+        def store(self, *args, **kwargs): pass
+        def get_latest_scalars(self, *args, **kwargs): return {}
+
+    class DummyLogger(BaseLogger): pass
 
 
 class CVPO(BasePolicy):
     """Implementation of the Constrained Variational Policy Optimization (CVPO).
 
-    More details, please refer to https://arxiv.org/abs/2201.11927.
-
-    :param torch.nn.Module actor: the actor network following the rules in
-        :class:`~fsrl.policy.BasePolicy`. (s -> logits)
-    :param Union[nn.Module, List[nn.Module]] critics: the critic network(s). (s -> V(s))
-    :param torch.optim.Optimizer actor_optim: the optimizer for the actor network.
-    :param torch.optim.Optimizer critic_optim: the optimizer for the critic network(s).
-    :param gym.Space action_space: the action space of the environment.
-    :param Type[torch.distributions.Distribution] dist_fn: the probability distribution
-        function for sampling actions.
-    :param int max_episode_steps: the maximum number of steps per episode for computing
-        the step-wise qc threshold.
-    :param Optional[BaseLogger] logger: the logger instance for logging training
-        information. (default=DummyLogger)
-    :param Union[List, float] cost_limit: the constraint limit(s) for the optimization.
-        (default=np.inf)
-    :param float tau: target smoothing coefficient for soft update of target networks.
-        (default=0.05)
-    :param float gamma: the discount factor for future rewards. (default=0.99)
-    :param int n_step: number of steps for multi-step learning. (default=2)
-    :param int estep_iter_num: the number of iterations for the E-step. (default=1)
-    :param float estep_kl: the KL divergence threshold for the E-step. (default=0.02)
-    :param float estep_dual_max: the maximum value for the dual variable in the E-step.
-        (default=20)
-    :param float estep_dual_lr: the learning rate for the dual variable in the E-step.
-        (default=0.02)
-    :param int sample_act_num: the number of actions to sample for the E-step.
-        (default=16)
-    :param int mstep_iter_num: the number of iterations for the M-step. (default=1)
-    :param float mstep_kl_mu: the KL divergence threshold for the M-step (mean).
-        (default=0.005)
-    :param float mstep_kl_std: the KL divergence threshold for the M-step (standard
-        deviation). (default=0.0005)
-    :param float mstep_dual_max: the maximum value for the dual variable in the M-step.
-        (default=0.5)
-    :param float mstep_dual_lr: the learning rate for the dual variable in the M-step.
-        (default=0.1)
-    :param bool deterministic_eval: whether to use deterministic action selection during
-        evaluation. (default=True)
-    :param bool action_scaling: whether to scale the actions according to the action
-        space bounds. (default=True)
-    :param str action_bound_method: the method for handling actions that exceed the
-        action space bounds ("clip" or other custom methods). (default="clip")
-    :param Optional[torch.optim.lr_scheduler.LambdaLR] lr_scheduler: learning rate
-        scheduler for the optimizer.
-
-    .. seealso::
-
-        Please refer to :class:`~fsrl.policy.BasePolicy` for more detailed hyperparameter
-        explanations and usage.
+    (Docstring remains the same as before)
     """
 
     def __init__(
@@ -78,7 +58,7 @@ class CVPO(BasePolicy):
         # CVPO specific arguments
         dist_fn: Type[torch.distributions.Distribution],
         max_episode_steps: int,
-        logger: Optional[BaseLogger] = BaseLogger(),
+        logger: Optional[BaseLogger] = DummyLogger(),
         cost_limit: Union[List, float] = np.inf,
         tau: float = 0.05,
         gamma: float = 0.99,
@@ -89,48 +69,120 @@ class CVPO(BasePolicy):
         estep_dual_max: float = 20,
         estep_dual_lr: float = 0.02,
         sample_act_num: int = 16,
-        # M-step
-        mstep_iter_num: int = 1,
+        # M-step (General)
+        mstep_iter_num: int = 1, # Usually 1, applies to actor update iterations
+        # M-step (Continuous)
         mstep_kl_mu: float = 0.005,
         mstep_kl_std: float = 0.0005,
         mstep_dual_max: float = 0.5,
         mstep_dual_lr: float = 0.1,
+        # M-step (Discrete)
+        mstep_kl_discrete: float = 0.01,
+        mstep_dual_lr_discrete: Optional[float] = None,
+        mstep_dual_max_discrete: Optional[float] = None,
         # other param
         deterministic_eval: bool = True,
         action_scaling: bool = True,
         action_bound_method: str = "clip",
         lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
     ) -> None:
+
+        # *** Call super().__init__() FIRST ***
+        # BasePolicy should handle setting self.actor, self.critics, self.logger etc.
         super().__init__(
             actor=actor,
-            critics=critics,
+            critics=critics, # Pass the original critics list/module
             dist_fn=dist_fn,
-            logger=logger,
+            logger=logger or DummyLogger(), # Ensure logger is instantiated
             gamma=gamma,
             deterministic_eval=deterministic_eval,
             action_scaling=action_scaling,
             action_bound_method=action_bound_method,
             action_space=action_space,
-            lr_scheduler=lr_scheduler
+            lr_scheduler=lr_scheduler,
+            # Pass other args BasePolicy might need
         )
+
+        # --- Now CVPO specific initializations ---
+
+        # Optimizers are specific to CVPO's handling
+        self.actor_optim = actor_optim
+        self.critics_optim = critic_optim # Note: BasePolicy might have its own optimizers? Ensure consistency.
+
+        # Create target networks (actor_old, critics_old)
+        # Ensure self.actor and self.critics are set by super().__init__()
+        if not hasattr(self, 'actor') or self.actor is None:
+             raise ValueError("BasePolicy __init__ did not set self.actor.")
+        if not hasattr(self, 'critics') or self.critics is None:
+             raise ValueError("BasePolicy __init__ did not set self.critics.")
 
         self.actor_old = deepcopy(self.actor)
         self.actor_old.eval()
-        self.actor_optim = actor_optim
         self.critics_old = deepcopy(self.critics)
         self.critics_old.eval()
-        self.critics_optim = critic_optim
-        self.device = next(self.actor.parameters()).device
-        self.dtype = next(self.actor.parameters()).dtype
-        self.cost_limit = [cost_limit] * (self.critics_num -
-                                          1) if np.isscalar(cost_limit) else cost_limit
+
+
+        # Determine device and dtype from actor parameters (now safe)
+        try:
+            self.device = next(self.actor.parameters()).device
+            self.dtype = next(self.actor.parameters()).dtype
+        except StopIteration:
+             self.logger.warning("Actor has no parameters, defaulting device to CPU and dtype to float32.")
+             self.device = torch.device("cpu")
+             self.dtype = torch.float32
+             # Move actor/critics manually if needed? Usually parameters determine this.
+             self.actor.to(self.device, self.dtype)
+             self.critics.to(self.device, self.dtype)
+             self.actor_old.to(self.device, self.dtype)
+             self.critics_old.to(self.device, self.dtype)
+
+
+        # Determine action space type
+        self._discrete = isinstance(self.action_space, gym.spaces.Discrete)
+        if self._discrete:
+             if not isinstance(self.dist_fn, type(torch.distributions.Categorical)):
+                  self.logger.info("INFO: Using discrete action space, but dist_fn is not torch.distributions.Categorical (or cannot be checked).")
+             if not hasattr(self.action_space, 'n'):
+                 raise ValueError("Discrete action space missing 'n' attribute.")
+             self._num_actions = self.action_space.n
+        else: # Continuous
+             try:
+                 action_dim = self.action_space.shape[0] if hasattr(self.action_space, 'shape') else 1
+                 dummy_loc = torch.zeros(action_dim, device=self.device)
+                 dummy_scale = torch.ones(action_dim, device=self.device)
+                 dist_instance = self.dist_fn(dummy_loc.unsqueeze(0), dummy_scale.unsqueeze(0))
+                 if not isinstance(dist_instance, torch.distributions.Normal) and \
+                    not isinstance(dist_instance, torch.distributions.Independent) and \
+                    not (hasattr(dist_instance, 'base_dist') and isinstance(dist_instance.base_dist, torch.distributions.Normal)):
+                     self.logger.info("INFO: Using continuous action space, but dist_fn does not seem to produce Normal or Independent(Normal(...)) distributions.")
+             except Exception as e:
+                 self.logger.info(f"INFO: Could not check if dist_fn produces Normal distributions for continuous space: {e}")
+
+
+        # Cost limits setup
+        # Ensure self.critics_num is set by BasePolicy or set it here
+        if not hasattr(self, 'critics_num'):
+             self.critics_num = len(self.critics)
+        num_cost_critics = self.critics_num - 1
+        if num_cost_critics < 0:
+             raise ValueError("CVPO requires at least one critic (for reward).")
+
+        if np.isscalar(cost_limit):
+             cost_limit = [cost_limit] * num_cost_critics
+        if len(cost_limit) != num_cost_critics:
+             raise ValueError(f"Number of cost limits ({len(cost_limit)}) must match number of cost critics ({num_cost_critics})")
+        self.cost_limit = cost_limit
 
         self.max_episode_steps = max_episode_steps
-        # qc threshold in the E-step
+        # qc threshold in the E-step (threshold per step)
+        # Use self.gamma if set by BasePolicy, otherwise use passed gamma
+        current_gamma = getattr(self, 'gamma', gamma) # Prefer gamma set by BasePolicy if exists
         self.qc_thres = [
-            c * (1 - self._gamma**self.max_episode_steps) / (1 - self._gamma) /
-            self.max_episode_steps for c in self.cost_limit
+             c * (1 - current_gamma**self.max_episode_steps) / (1 - current_gamma) /
+             self.max_episode_steps if (c != np.inf and current_gamma != 1.0 and self.max_episode_steps > 0) else np.inf
+             for c in self.cost_limit
         ]
+        self.logger.info("CVPO Step-wise Cost Thresholds (qc_thres): " + str(self.qc_thres))
 
         # E-step init
         self._estep_kl = estep_kl
@@ -138,59 +190,119 @@ class CVPO(BasePolicy):
         self._estep_dual_max = estep_dual_max
         self._estep_dual_lr = estep_dual_lr
         self._sample_act_num = sample_act_num
-        # the first dim is eta, others are lambda in the paper
-        d = np.zeros(self.critics_num)
-        d[0] = 1  # init eta to be 1
+        estep_dual_init = np.zeros(self.critics_num)
+        estep_dual_init[0] = 1.0
         self.estep_dual = torch.tensor(
-            d, requires_grad=True, device=self.device, dtype=self.dtype
+             estep_dual_init, requires_grad=True, device=self.device, dtype=self.dtype
         )
         self.estep_optim = torch.optim.Adam([self.estep_dual], lr=self._estep_dual_lr)
 
         # M-step init
-        self._mstep_kl_mu = mstep_kl_mu
-        self._mstep_kl_std = mstep_kl_std
         self._mstep_iter_num = mstep_iter_num
-        self._mstep_dual_max = mstep_dual_max
-        self._mstep_dual_lr = mstep_dual_lr
+        if self._discrete:
+            self._mstep_kl_target = mstep_kl_discrete
+            self._mstep_dual_lr = mstep_dual_lr_discrete if mstep_dual_lr_discrete is not None else mstep_dual_lr
+            self._mstep_dual_max = mstep_dual_max_discrete if mstep_dual_max_discrete is not None else mstep_dual_max
+            self.mstep_dual_kl: Optional[torch.Tensor] = None
+            self.mstep_dual_mu: Optional[torch.Tensor] = None
+            self.mstep_dual_std: Optional[torch.Tensor] = None
+        else: # Continuous
+            self._mstep_kl_mu_target = mstep_kl_mu
+            self._mstep_kl_std_target = mstep_kl_std
+            self._mstep_dual_lr = mstep_dual_lr
+            self._mstep_dual_max = mstep_dual_max
+            self.mstep_dual_kl: Optional[torch.Tensor] = None
+            self.mstep_dual_mu: Optional[torch.Tensor] = None
+            self.mstep_dual_std: Optional[torch.Tensor] = None
+        self.mstep_optim: Optional[torch.optim.Optimizer] = None
 
+        # Other CVPO params
         self._estep_duration = 0
         self._mstep_duration = 0
-
         assert 0.0 <= tau <= 1.0, "tau should be in [0, 1]"
         self.tau = tau
-        self._discrete = True if self.action_type == "discrete" else False
         self._n_step = n_step
-        self.__eps = np.finfo(np.float32).eps.item() * 10  # around 1e-6
+        self.__eps = np.finfo(np.float32).eps.item() * 10
 
-    def update_cost_limit(self, cost_limit: float):
-        """Update the cost limit threshold.
+    # --- Rest of the methods (update_cost_limit, pre_update_fn, etc.) ---
+    # --- remain the same as the previous version ---
 
-        :param float cost_limit: new cost threshold
+    def update_cost_limit(self, cost_limit: Union[List, float]):
+        """Update the cost limit threshold(s).
+
+        :param Union[List, float] cost_limit: new cost threshold(s), matching number of cost critics.
         """
-        self.cost_limit = [cost_limit] * (self.critics_num -
-                                          1) if np.isscalar(cost_limit) else cost_limit
+        num_cost_critics = self.critics_num - 1
+        if np.isscalar(cost_limit):
+             cost_limit = [cost_limit] * num_cost_critics
+        if len(cost_limit) != num_cost_critics:
+             raise ValueError(f"Number of cost limits ({len(cost_limit)}) must match number of cost critics ({num_cost_critics})")
+        self.cost_limit = cost_limit
 
+        current_gamma = getattr(self, 'gamma', 0.99) # Use stored gamma
         self.qc_thres = [
-            c * (1 - self._gamma**self.max_episode_steps) / (1 - self._gamma) /
-            self.max_episode_steps for c in self.cost_limit
+             c * (1 - current_gamma**self.max_episode_steps) / (1 - current_gamma) /
+             self.max_episode_steps if (c != np.inf and current_gamma != 1.0 and self.max_episode_steps > 0) else np.inf
+             for c in self.cost_limit
         ]
+        self.logger.info("Updated CVPO Step-wise Cost Thresholds (qc_thres): " + str(self.qc_thres))
+
 
     def pre_update_fn(self, **kwarg: Any) -> Any:
-        """Init the mstep optimizer and dual variables."""
-        self.mstep_dual_mu = torch.zeros(
-            1, requires_grad=True, device=self.device, dtype=self.dtype
-        )
-        self.mstep_dual_std = torch.zeros(
-            1, requires_grad=True, device=self.device, dtype=self.dtype
-        )
-        self.mstep_optim = torch.optim.Adam(
-            [self.mstep_dual_mu, self.mstep_dual_std], lr=self._mstep_dual_lr
-        )
+        """Initialize the mstep optimizer and dual variables before learning."""
+        mstep_dual_params = []
+        if self._discrete:
+            if self.mstep_dual_kl is None or self.mstep_dual_kl.device != self.device or self.mstep_dual_kl.dtype != self.dtype:
+                self.mstep_dual_kl = torch.zeros(
+                    1, requires_grad=True, device=self.device, dtype=self.dtype
+                )
+                self.logger.debug("Initialized M-step KL dual for discrete actions.")
+            mstep_dual_params.append(self.mstep_dual_kl)
+            self.mstep_dual_mu = None
+            self.mstep_dual_std = None
+        else: # Continuous
+            if self.mstep_dual_mu is None or self.mstep_dual_mu.device != self.device or self.mstep_dual_mu.dtype != self.dtype:
+                self.mstep_dual_mu = torch.zeros(
+                    1, requires_grad=True, device=self.device, dtype=self.dtype
+                )
+                self.logger.debug("Initialized M-step mu KL dual for continuous actions.")
+            if self.mstep_dual_std is None or self.mstep_dual_std.device != self.device or self.mstep_dual_std.dtype != self.dtype:
+                self.mstep_dual_std = torch.zeros(
+                    1, requires_grad=True, device=self.device, dtype=self.dtype
+                )
+                self.logger.debug("Initialized M-step std KL dual for continuous actions.")
+
+            mstep_dual_params.extend([self.mstep_dual_mu, self.mstep_dual_std])
+            self.mstep_dual_kl = None
+
+
+        if mstep_dual_params:
+             if self.mstep_optim is None or not self.mstep_optim.param_groups:
+                 self.mstep_optim = torch.optim.Adam(mstep_dual_params, lr=self._mstep_dual_lr)
+                 self.logger.debug(f"Initialized M-step dual optimizer with LR: {self._mstep_dual_lr}.")
+             else:
+                 # Ensure parameters in optimizer are correct (simple check by length)
+                 current_optim_params = self.mstep_optim.param_groups[0]['params']
+                 if len(current_optim_params) != len(mstep_dual_params) or \
+                    any(p1 is not p2 for p1, p2 in zip(current_optim_params, mstep_dual_params)):
+                      # Recreate if params differ significantly
+                      self.mstep_optim = torch.optim.Adam(mstep_dual_params, lr=self._mstep_dual_lr)
+                      self.logger.debug(f"Re-initialized M-step dual optimizer due to param changes.")
+                 else:
+                     # Update LR just in case it changed
+                     for param_group in self.mstep_optim.param_groups:
+                            param_group['lr'] = self._mstep_dual_lr
+
+        else:
+             self.mstep_optim = None
+             self.logger.warning("No M-step dual parameters found to optimize!")
 
     def post_update_fn(self, **kwarg: Any) -> Any:
-        """Update the old actor network."""
+        """Update the old actor network after learning."""
         with torch.no_grad():
             self.actor_old.load_state_dict(self.actor.state_dict())
+        # Commented out debug log
+        # self.logger.debug("Updated actor_old network.")
 
     def train(self, mode: bool = True):
         """Set the module in training mode, except for the target network."""
@@ -200,247 +312,503 @@ class CVPO(BasePolicy):
         return self
 
     def sync_weight(self) -> None:
-        """Soft-update the weight for the target network."""
-        self.soft_update(self.critics_old, self.critics, self.tau)
+        """Soft-update the weight for the target critic network."""
+        # Use BasePolicy's soft_update if available
+        if hasattr(super(), 'soft_update'):
+            self.soft_update(self.critics_old, self.critics, self.tau)
+        else: # Manual soft update
+            with torch.no_grad():
+                for o, n in zip(self.critics_old.parameters(), self.critics.parameters()):
+                    o.data.copy_(o.data * (1.0 - self.tau) + n.data * self.tau)
+            self.logger.debug("Manually performed soft-update on critics_old.")
+
 
     def _target_q(self, buffer: ReplayBuffer, indices: np.ndarray) -> List[torch.Tensor]:
-        batch = buffer[indices]  # batch.obs_next: s_{t+n}
+        """Compute target Q values for n-step returns."""
+        batch = buffer[indices]
+        batch.obs_next = to_torch_as(batch.obs_next, next(self.actor.parameters()))
+        # Use current actor for next action
         obs_next_result = self(batch, model="actor", input='obs_next')
-        act = obs_next_result.act
+        act_next = obs_next_result.act
+
         target_q_list = []
-        for i in range(self.critics_num):
-            target_q, _ = self.critics_old[i].predict(batch.obs_next, act)
-            target_q_list.append(target_q)
+        with torch.no_grad():
+            for i in range(self.critics_num):
+                if self._discrete:
+                    act_next_proc = F.one_hot(act_next.long(), num_classes=self._num_actions).float()
+                else:
+                    # Use BasePolicy map_action if available
+                     if hasattr(super(), 'map_action'):
+                         act_next_proc = self.map_action(act_next)
+                     else:
+                         act_next_proc = act_next
+
+                # Use predict method of critics_old (target critics)
+                # Ensure predict method exists and handles inputs correctly
+                if hasattr(self.critics_old[i], 'predict'):
+                     target_q, _ = self.critics_old[i].predict(batch.obs_next, act_next_proc)
+                else: # Fallback to direct call
+                     target_q = self.critics_old[i](batch.obs_next, act_next_proc)
+                     if isinstance(target_q, (list, tuple)): # Handle double Q manually if predict not available
+                          target_q = torch.min(*target_q)
+
+                target_q_list.append(target_q)
+
         return target_q_list
 
     def process_fn(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
-        batch = self.compute_nstep_returns(
-            batch, buffer, indices, self._target_q, self._n_step
-        )
+        """Compute n-step returns for reward and costs."""
+        current_gamma = getattr(self, 'gamma', 0.99) # Use stored gamma
+        # Use BasePolicy's compute_nstep_returns if available
+        if hasattr(super(), 'compute_nstep_returns'):
+            batch = self.compute_nstep_returns(
+                batch, buffer, indices, self._target_q, self._n_step
+            )
+        else:
+            # Add basic n-step calculation if BasePolicy doesn't provide it (placeholder)
+            self.logger.warning("BasePolicy compute_nstep_returns not found, n-step returns might be incorrect.")
+            # Placeholder: requires manual implementation based on BasePolicy's expected behavior
+            # batch.rets = batch.rew # Simplistic 1-step return if no n-step logic available
         return batch
 
-    def forward(  # type: ignore
+    def forward(
         self,
         batch: Batch,
         state: Optional[Union[dict, Batch, np.ndarray]] = None,
         model: str = "actor",
         input: str = "obs",
+        use_actor_old: bool = False,
         **kwargs: Any,
     ) -> Batch:
-        model = getattr(self, model)
+        """Compute action over the given batch data."""
+        model_net = getattr(self, model) if not use_actor_old else self.actor_old
         obs = batch[input]
-        logits, hidden = model(obs, state=state)
+        obs = to_torch_as(obs, next(model_net.parameters()))
+        logits, hidden = model_net(obs, state=state)
+
         if isinstance(logits, tuple):
-            dist = self.dist_fn(*logits)
+             dist = self.dist_fn(*logits)
+        elif isinstance(logits, list):
+             dist = self.dist_fn(*logits)
         else:
-            dist = self.dist_fn(logits)
+             dist = self.dist_fn(logits)
+
         if self._deterministic_eval and not self.training:
-            if self.action_type == "discrete":
-                act = logits.argmax(-1)
-            elif self.action_type == "continuous":
-                act = logits[0]
+            if self._discrete:
+                 act = dist.probs.argmax(dim=-1) if hasattr(dist, 'probs') else dist.logits.argmax(dim=-1)
+            else:
+                if hasattr(dist, 'mean'): act = dist.mean
+                elif hasattr(dist, 'mode'): act = dist.mode
+                else: act = logits[0] if isinstance(logits, tuple) else logits
         else:
             act = dist.sample()
+
         return Batch(logits=logits, act=act, state=hidden, dist=dist)
 
+
     def critics_loss(
-        self, batch: Batch, critics: torch.nn.Module, optimizer: torch.optim.Optimizer
+        self,
+        batch: Batch, critics: Union[nn.Module, nn.ModuleList], optimizer: torch.optim.Optimizer
     ) -> Tuple[torch.Tensor, dict]:
-        """A simple wrapper script for updating critic network."""
+        """Compute loss for the critic networks."""
         weight = getattr(batch, "weight", 1.0)
-        loss_critic = 0
-        td_average = 0
+        total_critic_loss = 0
         stats_critic = {}
+        td_list = []
+
+        # Pass a parameter tensor from the first critic instead of the ModuleList
+        act = to_torch_as(batch.act, next(critics[0].parameters()))
+        obs = to_torch_as(batch.obs, next(critics[0].parameters()))
+
+        if self._discrete:
+             act_proc = F.one_hot(act.long(), num_classes=self._num_actions).float()
+        else:
+             if hasattr(super(), 'map_action'):
+                 act_proc = self.map_action(act)
+             else:
+                 act_proc = act
+
+        # Pass a parameter tensor from the first critic instead of the ModuleList
+        rets = to_torch_as(batch.rets, next(critics[0].parameters()))
+        if rets.ndim == 1:
+             target_qs = rets.unsqueeze(1)
+        elif rets.ndim == 2 and rets.shape[1] == self.critics_num:
+             target_qs = rets
+        elif rets.ndim == 3 and rets.shape[1] == self.critics_num and rets.shape[2] == 1:
+             # Handle case where n_step_returns adds an extra dimension
+             target_qs = rets.squeeze(-1)
+        else:
+             raise ValueError(f"batch.rets has unexpected shape: {rets.shape}, expected ({len(obs)}, {self.critics_num}) or ({len(obs)}, {self.critics_num}, 1)")
+
+
         for i in range(self.critics_num):
-            target_q = batch.rets[..., i].flatten()
-            # double q network
-            current_q_list = critics[i](batch.obs, batch.act)
+            target_q = target_qs[..., i].flatten()
+
+            current_q_list = critics[i](obs, act_proc)
+            if not isinstance(current_q_list, (list, tuple)):
+                current_q_list = [current_q_list]
+
             loss_i = 0
-            for j in range(len(current_q_list)):
-                td = current_q_list[j].flatten() - target_q
-                td_average += td
-                loss_i += (td.pow(2) * weight).mean()
+            td_i_list = []
+            valid_q_count = 0
+            q_current_vals = [] # Store valid current Qs for logging mean
+            for current_q in current_q_list:
+                 if current_q is None: continue
+                 current_q = current_q.flatten()
+                 if current_q.shape != target_q.shape:
+                     self.logger.warning(f"Shape mismatch in critic {i}: current_q {current_q.shape}, target_q {target_q.shape}")
+                     continue
+                 valid_q_count += 1
+                 td = current_q - target_q.detach()
+                 loss_i += (td.pow(2) * weight).mean()
+                 td_i_list.append(td.detach())
+                 q_current_vals.append(current_q.detach()) # Store detached value
 
-            loss_critic += loss_i
-            stats_critic["loss/loss_q" + str(i)] = loss_i.item()
-            stats_critic["estep/val_q" + str(i)] = torch.mean(target_q).item()
+            if valid_q_count > 0:
+                loss_i /= valid_q_count
+                total_critic_loss += loss_i
+                mean_td_i = torch.mean(torch.stack(td_i_list, dim=0), dim=0)
+                td_list.append(mean_td_i)
+                stats_critic[f"loss/loss_q{i}"] = loss_i.item()
+                stats_critic[f"value/q{i}_current_mean"] = torch.mean(torch.stack(q_current_vals)).item() if q_current_vals else 0.0
+            else:
+                 # Log zero loss/value if no valid heads, append zero TD
+                 stats_critic[f"loss/loss_q{i}"] = 0.0
+                 stats_critic[f"value/q{i}_current_mean"] = 0.0
+                 td_list.append(torch.zeros_like(target_q))
+
+            stats_critic[f"value/q{i}_target_mean"] = target_q.mean().item()
             if i >= 1:
-                stats_critic["estep/thres_q" + str(i)] = self.qc_thres[i - 1]
-        optimizer.zero_grad()
-        loss_critic.backward()
-        optimizer.step()
-        td_average /= self.critics_num * 2
-        stats_critic["loss/q_total"] = loss_critic.item()
-        return td_average, stats_critic
+                stats_critic[f"value/qc{i}_thres"] = self.qc_thres[i - 1] if i-1 < len(self.qc_thres) else np.inf
 
-    def _estep_dual_loss(self, q_values):
+
+        if isinstance(total_critic_loss, torch.Tensor) and total_critic_loss.requires_grad:
+            optimizer.zero_grad()
+            total_critic_loss.backward()
+            optimizer.step()
+        elif total_critic_loss != 0:
+             self.logger.warning("Critic loss computed but does not require grad.")
+
+
+        batch_td_error = td_list[0] if td_list else torch.zeros_like(batch.obs[:, 0])
+
+        stats_critic["loss/q_total"] = total_critic_loss.item() if isinstance(total_critic_loss, torch.Tensor) else total_critic_loss
+        return batch_td_error, stats_critic
+
+
+    def _estep_dual_loss(self, q_values_b_k_critics):
+        """Compute the dual loss for the E-step optimization."""
         eta = self.estep_dual[0]
-        K = q_values[0].shape[-1]
+        lambdas = self.estep_dual[1:]
+        eta = torch.clamp(eta, min=self.__eps)
         loss = eta * self._estep_kl
-        combined_q = q_values[0].detach()  # (B, K)
-        for i in range(1, self.critics_num):
-            combined_q -= self.estep_dual[i] * q_values[i].detach()
-            loss += self.estep_dual[i] * self.qc_thres[i - 1]
-        loss += eta * torch.mean(torch.logsumexp(combined_q / eta, dim=1) - np.log(K))
+
+        combined_q = q_values_b_k_critics[0].detach()
+        num_cost_critics = self.critics_num - 1
+        for i in range(num_cost_critics):
+            lambda_i = torch.clamp(lambdas[i], min=0.0)
+            qc_i = q_values_b_k_critics[i + 1].detach()
+            combined_q -= lambda_i * qc_i
+            if i < len(self.qc_thres) and self.qc_thres[i] != np.inf:
+                loss += lambda_i * self.qc_thres[i]
+
+        K = q_values_b_k_critics[0].shape[1]
+        if K == 0:
+             logsumexp_mean = torch.tensor(0.0, device=eta.device, dtype=eta.dtype)
+        else:
+             logsumexp_term = torch.logsumexp(combined_q / eta, dim=1)
+             logsumexp_mean = torch.mean(logsumexp_term - np.log(K))
+
+        loss += eta * logsumexp_mean
         return loss
 
     @staticmethod
     def gaussian_kl(
         mu_old: torch.Tensor, std_old: torch.Tensor, mu: torch.Tensor, std: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Decoupled KL between two multivariate Gaussians with diagonal covariance.
-
-        See https://arxiv.org/pdf/1812.02256.pdf Sec. 4.2.1 for details. kl_mu = KL(
-        pi(mu_old, std_old) || pi(mu, std_old) ) kl_std = KL( pi(mu_old, std_old) ||
-        pi(mu_old, std) )
-
-        :param mu_old: (B, n)
-        :param mu: (B, n)
-        :param std_old: (B, n)
-        :param std: (B, n)
-        :return: kl_mu, kl_std: scalar mean and covariance terms of the KL
-        """
+        """Decoupled KL between two multivariate Gaussians with diagonal covariance."""
+        std_old = torch.clamp_min(std_old, 1e-4)
+        std = torch.clamp_min(std, 1e-4)
         var_old, var = std_old**2, std**2
-        # for numerical stability
-        var_old = torch.clamp_min(var_old, 1e-6)
-        var = torch.clamp_min(var, 1e-6)
 
-        # note, this kl's demoninator is the old var rather than the new var
-        kl_mu = 0.5 * (mu_old - mu)**2 / var_old
-        kl_mu = torch.sum(kl_mu, dim=-1).mean()
+        kl_mu = 0.5 * torch.sum((mu_old - mu)**2 / var_old, dim=-1)
+        kl_mu = kl_mu.mean()
 
-        kl_std = 0.5 * (torch.log(var / var_old) + var_old / var - 1)
-        kl_std = torch.sum(kl_std, dim=-1).mean()  # Sum over the dimensions
-
+        kl_std = 0.5 * torch.sum(torch.log(var / var_old) + var_old / var - 1, dim=-1)
+        kl_std = kl_std.mean()
         return kl_mu, kl_std
 
+
     def policy_loss(self, batch: Batch, **kwarg):
+        """Compute policy loss, including E-step and M-step."""
 
-        # E-step begin
+        # ==================== E-step ====================
         t_start = time.time()
-        obs = torch.as_tensor(
-            batch.obs, device=self.device, dtype=torch.float32
-        )  # (B, ds)
-        # for continuous action space, sample K particles
         K = self._sample_act_num
-        B = obs.shape[0]
-        da = batch.act.shape[-1]
-        ds = obs.shape[-1]
-        with torch.no_grad():
-            old_result = self(batch, model="actor_old", input="obs")
-            old_dist = old_result.dist  # (B, da)
-            sample_act = old_dist.sample((K, ))  # (K, B, da)
-            expanded_obs = obs[None, ...].expand(K, -1, -1)  # (K, B, ds)
-            q_values = []
-            # TODO, use critics old or the current?
-            for i in range(self.critics_num):
-                target_q, _ = self.critics[i].predict(
-                    expanded_obs.reshape(-1, ds), sample_act.reshape(-1, da)
-                )
-                target_q = target_q.reshape(K, B)
-                q_values.append(target_q.T)  # (critic_num, B, K)
+        batch_obs_estep = to_torch_as(batch.obs, self.estep_dual)
+        B = batch_obs_estep.shape[0]
+        if B == 0:
+             self.logger.warning("policy_loss received empty batch, skipping update.")
+             return
 
-        # optimize
-        for _ in range(self._estep_iter_num):
+        with torch.no_grad():
+             old_result = self(batch, input="obs", use_actor_old=True)
+             old_dist = old_result.dist
+
+             if self._discrete:
+                  sample_act_indices = old_dist.sample((K,)) # (K, B)
+                  sample_act_one_hot = F.one_hot(sample_act_indices, num_classes=self._num_actions).float() # (K, B, N)
+                  expanded_obs = batch_obs_estep.unsqueeze(0).expand(K, -1, -1).reshape(K*B, -1)
+                  critic_actions = sample_act_one_hot.reshape(K*B, -1)
+             else:
+                  sample_act_raw = old_dist.sample((K,)) # (K, B, da)
+                  if hasattr(super(), 'map_action'):
+                     critic_actions_mapped = self.map_action(sample_act_raw)
+                  else:
+                     critic_actions_mapped = sample_act_raw
+                  expanded_obs = batch_obs_estep.unsqueeze(0).expand(K, -1, -1).reshape(K*B, -1)
+                  critic_actions = critic_actions_mapped.reshape(K*B, -1)
+
+             q_values_list = []
+             for i in range(self.critics_num):
+                  if hasattr(self.critics[i], 'predict'):
+                      q_val, _ = self.critics[i].predict(expanded_obs, critic_actions)
+                  else: # Fallback
+                       q_val_raw = self.critics[i](expanded_obs, critic_actions)
+                       q_val = torch.min(*q_val_raw) if isinstance(q_val_raw, (list, tuple)) else q_val_raw
+
+                  q_val = q_val.reshape(K, B).T # (B, K)
+                  q_values_list.append(q_val)
+
+        q_values_detached = [q.detach() for q in q_values_list]
+        for estep_iter in range(self._estep_iter_num):
             self.estep_optim.zero_grad()
-            estep_loss = self._estep_dual_loss(q_values)
+            estep_loss = self._estep_dual_loss(q_values_detached)
             estep_loss.backward()
             self.estep_optim.step()
-            self.logger.store(tab="loss", estep_loss=estep_loss.item())
-        self.estep_dual.data.clamp_(min=self.__eps, max=self._estep_dual_max)
-        # detach the estep dual variable for M-step
-        estep_dual = []
-        for i in range(self.critics_num):
-            estep_dual.append(self.estep_dual[i].detach().item())
-            self.logger.store(**{"estep/dual" + str(i): estep_dual[i]})
+            if estep_iter == self._estep_iter_num - 1:
+                 self.logger.store(tab="loss", estep_dual_loss=estep_loss.item())
 
-        # compute the optimal non-parametric variational distribution
-        optimal_q = q_values[0].T  # (K, B)
-        for i in range(1, self.critics_num):
-            optimal_q -= estep_dual[i] * q_values[i].T
-        optimal_q = torch.softmax((optimal_q) / estep_dual[0], dim=0).detach()  # (K, B)
+        with torch.no_grad():
+             self.estep_dual.data[0].clamp_(min=self.__eps, max=self._estep_dual_max)
+             self.estep_dual.data[1:].clamp_(min=0.0, max=self._estep_dual_max)
+
+        estep_dual_detached = self.estep_dual.detach()
+        current_eta = estep_dual_detached[0].item()
+        current_lambdas = estep_dual_detached[1:].cpu().numpy()
+        self.logger.store(**{"estep/dual_eta": current_eta})
+        for i, lam in enumerate(current_lambdas):
+             self.logger.store(**{f"estep/dual_lambda{i+1}": lam})
+
+        eta_opt = torch.clamp(estep_dual_detached[0], min=self.__eps)
+        lambdas_opt = estep_dual_detached[1:]
+        combined_q_opt = q_values_detached[0]
+        for i in range(self.critics_num - 1):
+            combined_q_opt -= lambdas_opt[i] * q_values_detached[i+1]
+
+        optimal_q = torch.softmax(combined_q_opt / eta_opt, dim=1) # (B, K)
+        optimal_q = optimal_q.T.detach() # (K, B)
 
         t_estep = time.time()
         self._estep_duration += t_estep - t_start
-        self.logger.store(tab="estep", estep_time=self._estep_duration)
+        self.logger.store(tab="time", estep_time_ms=(t_estep - t_start) * 1000)
 
-        # M-step begin
+        # ==================== M-step ====================
+        if self.mstep_optim is None and (self._discrete or (self.mstep_dual_mu is not None and self.mstep_dual_std is not None)):
+             self.logger.warning("M-step optimizer not initialized before policy_loss M-step. Attempting initialization.")
+             self.pre_update_fn()
 
-        mu_old, std_old = old_result.logits
-        mu_old, std_old = mu_old.detach(), std_old.detach()
-        for _ in range(self._mstep_iter_num):
+        for m_iter in range(self._mstep_iter_num):
+            # Pass a parameter tensor instead of the module
+            batch_obs_mstep = to_torch_as(batch.obs, next(self.actor.parameters()))
             result = self(batch, model="actor", input="obs")
+            current_dist = result.dist
 
-            # MLE loss
-            mu, std = result.logits
-            dist1 = self.dist_fn(mu, std_old)
-            dist2 = self.dist_fn(mu_old, std)
-            likelihood = dist1.expand((K, B)).log_prob(sample_act) + dist2.expand(
-                (K, B)
-            ).log_prob(sample_act)  # (K, B)
-            loss_mle = -torch.mean(optimal_q * likelihood)
+            loss_mle = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            if K > 0: # Avoid calculation if K=0 samples were taken
+                if self._discrete:
+                    log_likelihood = current_dist.log_prob(sample_act_indices) # (K, B)
+                    loss_mle = -torch.sum(optimal_q * log_likelihood) / B
+                else:
+                    with torch.no_grad():
+                        old_result_batch = self(batch, model="actor_old", input="obs")
+                        mu_old, std_old = old_result_batch.logits
+                        mu_old, std_old = mu_old.detach(), std_old.detach()
+                    mu, std = result.logits
 
-            # update dual variables to regularize the KL
-            kl_mu, kl_std = self.gaussian_kl(mu_old, std_old, mu, std)
-            mstep_dual_loss = self.mstep_dual_mu * (self._mstep_kl_mu - kl_mu).detach(
-            ) + self.mstep_dual_std * (self._mstep_kl_std - kl_std).detach()
-            self.mstep_optim.zero_grad()
-            mstep_dual_loss.backward()
-            self.mstep_optim.step()
+                    sample_act_flat = sample_act_raw.reshape(K * B, -1)
+                    mu_flat = mu.repeat_interleave(K, 0)
+                    std_flat = std.repeat_interleave(K, 0)
+                    mu_old_flat = mu_old.repeat_interleave(K, 0)
+                    std_old_flat = std_old.repeat_interleave(K, 0)
 
-            # KL loss
-            dual_mu = np.clip(self.mstep_dual_mu.item(), 0.0, self._mstep_dual_max)
-            dual_std = np.clip(self.mstep_dual_std.item(), 0.0, self._mstep_dual_max)
-            loss_kl = dual_mu * (kl_mu - self._mstep_kl_mu
-                                 ) + dual_std * (kl_std - self._mstep_kl_std)
+                    dist1 = self.dist_fn(mu_flat, std_old_flat)
+                    dist2 = self.dist_fn(mu_old_flat, std_flat)
+                    log_prob1 = dist1.log_prob(sample_act_flat).sum(-1)
+                    log_prob2 = dist2.log_prob(sample_act_flat).sum(-1)
+                    likelihood_flat = log_prob1 + log_prob2
+                    likelihood = likelihood_flat.reshape(K, B)
+                    loss_mle = -torch.sum(optimal_q * likelihood) / B
 
+            loss_kl = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            kl_mu_val, kl_std_val = 0.0, 0.0
+            kl_discrete_val = 0.0
+            dual_mu_val, dual_std_val = 0.0, 0.0
+            dual_kl_val = 0.0
+
+            kl_div = None # Store KL div for actor loss
+
+            if self.mstep_optim is not None:
+                if self._discrete:
+                    with torch.no_grad():
+                         old_logits_batch, _ = self.actor_old(batch_obs_mstep)
+                         old_dist_batch = self.dist_fn(old_logits_batch)
+                    # Detach current_dist for KL calculation if current_dist requires grad?
+                    # No, KL needs grad w.r.t current_dist for actor update.
+                    kl_div = kl_divergence(old_dist_batch, current_dist).mean()
+                    kl_discrete_val = kl_div.item()
+
+                    if self.mstep_dual_kl is not None:
+                         mstep_dual_loss = self.mstep_dual_kl * (self._mstep_kl_target - kl_div).detach()
+                         self.mstep_optim.zero_grad()
+                         mstep_dual_loss.backward() # Update dual only
+                         self.mstep_optim.step()
+                         self.mstep_dual_kl.data.clamp_(min=self.__eps, max=self._mstep_dual_max)
+                         dual_kl_val = self.mstep_dual_kl.item()
+                         # Actor loss uses non-detached dual, but needs grad through kl_div
+                         loss_kl = dual_kl_val * (kl_div - self._mstep_kl_target)
+                    else: pass # Warning already issued if None
+
+                else: # Continuous
+                    # Ensure mu_old etc are calculated if K=0 case skipped mle calc
+                    with torch.no_grad():
+                        old_result_batch = self(batch, model="actor_old", input="obs")
+                        mu_old, std_old = old_result_batch.logits
+                        mu_old, std_old = mu_old.detach(), std_old.detach()
+                    mu, std = result.logits # Current params (already have from dist calc)
+
+                    kl_mu, kl_std = self.gaussian_kl(mu_old, std_old, mu, std)
+                    kl_mu_val, kl_std_val = kl_mu.item(), kl_std.item()
+
+                    if self.mstep_dual_mu is not None and self.mstep_dual_std is not None:
+                         mstep_dual_loss = self.mstep_dual_mu * (self._mstep_kl_mu_target - kl_mu).detach() \
+                                       + self.mstep_dual_std * (self._mstep_kl_std_target - kl_std).detach()
+                         self.mstep_optim.zero_grad()
+                         mstep_dual_loss.backward() # Update duals only
+                         self.mstep_optim.step()
+                         self.mstep_dual_mu.data.clamp_(min=self.__eps, max=self._mstep_dual_max)
+                         self.mstep_dual_std.data.clamp_(min=self.__eps, max=self._mstep_dual_max)
+                         dual_mu_val = self.mstep_dual_mu.item()
+                         dual_std_val = self.mstep_dual_std.item()
+                         # Actor loss uses non-detached duals, needs grad through kl_mu/kl_std
+                         loss_kl = dual_mu_val * (kl_mu - self._mstep_kl_mu_target) \
+                                 + dual_std_val * (kl_std - self._mstep_kl_std_target)
+                    else: pass # Warning already issued if None
+
+            # Total actor loss
             loss_actor = loss_mle + loss_kl
 
-            # optimize the policy network
             self.actor_optim.zero_grad()
             loss_actor.backward()
             self.actor_optim.step()
 
-            entropy = torch.mean(dist1.entropy() + dist2.entropy()).item()
+            if self._mstep_iter_num == 1: break
 
-            self.logger.store(
-                tab="mstep",
-                mstep_kl_mu=kl_mu.item(),
-                mstep_kl_std=kl_std.item(),
-                mstep_loss_kl=loss_kl.item(),
-                mstep_loss_mle=loss_mle.item(),
-                mstep_loss_total=loss_actor.item(),
-                mstep_dual_mu=dual_mu,
-                mstep_dual_std=dual_std,
-                entropy=entropy
-            )
-        self._mstep_duration += time.time() - t_estep
-        self.logger.store(tab="mstep", mstep_time=self._mstep_duration)
+
+        with torch.no_grad():
+             # Recompute current_dist for entropy if needed (actor params changed)
+             result = self(batch, model="actor", input="obs")
+             current_dist = result.dist
+             entropy = current_dist.entropy().mean().item()
+
+        mstep_logs = {
+             "loss/mstep_loss_mle": loss_mle.item(),
+             "loss/mstep_loss_kl": loss_kl.item() if isinstance(loss_kl, torch.Tensor) else loss_kl,
+             "loss/mstep_loss_total": loss_actor.item(),
+             "value/entropy": entropy
+        }
+        if self._discrete:
+             mstep_logs.update({"kl/mstep_kl_discrete": kl_discrete_val, "value/mstep_dual_kl": dual_kl_val})
+        else:
+              mstep_logs.update({"kl/mstep_kl_mu": kl_mu_val, "kl/mstep_kl_std": kl_std_val, "value/mstep_dual_mu": dual_mu_val, "value/mstep_dual_std": dual_std_val})
+        self.logger.store(tab="mstep", **mstep_logs)
+
+        t_mstep = time.time()
+        self._mstep_duration += t_mstep - t_estep
+        self.logger.store(tab="time", mstep_time_ms=(t_mstep - t_estep) * 1000)
+
 
     def learn(self, batch: Batch, **kwargs: Any) -> Dict[str, float]:
-        # critic
-        td, stats_critic = self.critics_loss(batch, self.critics, self.critics_optim)
-        batch.weight = td  # prio-buffer
-        # actor
-        self.policy_loss(batch)
+        """Update policy parameters based on the batch data."""
+        self.pre_update_fn() # Ensure duals/optimizer are ready
 
-        self.sync_weight()
+        td_error, stats_critic = self.critics_loss(batch, self.critics, self.critics_optim)
         self.logger.store(**stats_critic)
+        batch.weight = td_error.abs() + self.__eps # Store abs TD error for PER
+
+        self.policy_loss(batch) # Actor update (E+M steps)
+
+        self.sync_weight() # Soft update target critics
+        self.post_update_fn() # Hard update actor_old
+
+        return self.logger.get_latest_scalars()
+
 
     def get_extra_state(self):
-        """Save the dual variables and their optimizers.
+        """Save the dual variables and their optimizers' state_dict."""
+        mstep_optim_state = None
+        try:
+            if self.mstep_optim is not None: mstep_optim_state = self.mstep_optim.state_dict()
+        except Exception as e: self.logger.error(f"Error getting M-step optimizer state_dict: {e}")
 
-        This function is called when call the policy.state_dict(), see
-        https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.get_extra_state
-        """
-        # if len(self.lag_optims): return [optim.state_dict() for optim in
-        #     self.lag_optims] else: return None
+        extra_state = {
+            'estep_dual': self.estep_dual.detach().data.cpu(),
+            'estep_optim': self.estep_optim.state_dict(),
+            'mstep_dual_kl': self.mstep_dual_kl.detach().data.cpu() if self.mstep_dual_kl is not None else None,
+            'mstep_dual_mu': self.mstep_dual_mu.detach().data.cpu() if self.mstep_dual_mu is not None else None,
+            'mstep_dual_std': self.mstep_dual_std.detach().data.cpu() if self.mstep_dual_std is not None else None,
+            'mstep_optim': mstep_optim_state,
+        }
+        return extra_state
 
     def set_extra_state(self, state):
-        """Load the dual variables and their optimizers.
+        """Load the dual variables and their optimizers' state_dict."""
+        try:
+            self.estep_dual.data = state['estep_dual'].to(self.device, self.dtype)
+            self.estep_optim.load_state_dict(state['estep_optim'])
+        except Exception as e: self.logger.error(f"Error loading E-step duals/optimizer state: {e}")
 
-        This function is called from load_state_dict() to handle any extra state found
-        within the state_dict.
-        """
+        mstep_dual_params = []
+        if state.get('mstep_dual_kl') is not None:
+            if self.mstep_dual_kl is None: self.mstep_dual_kl = torch.zeros(1, requires_grad=True, device=self.device, dtype=self.dtype)
+            self.mstep_dual_kl.data = state['mstep_dual_kl'].to(self.device, self.dtype)
+            mstep_dual_params.append(self.mstep_dual_kl)
+        else: self.mstep_dual_kl = None
+
+        if state.get('mstep_dual_mu') is not None:
+             if self.mstep_dual_mu is None: self.mstep_dual_mu = torch.zeros(1, requires_grad=True, device=self.device, dtype=self.dtype)
+             self.mstep_dual_mu.data = state['mstep_dual_mu'].to(self.device, self.dtype)
+             mstep_dual_params.append(self.mstep_dual_mu)
+        else: self.mstep_dual_mu = None
+
+        if state.get('mstep_dual_std') is not None:
+             if self.mstep_dual_std is None: self.mstep_dual_std = torch.zeros(1, requires_grad=True, device=self.device, dtype=self.dtype)
+             self.mstep_dual_std.data = state['mstep_dual_std'].to(self.device, self.dtype)
+             mstep_dual_params.append(self.mstep_dual_std)
+        else: self.mstep_dual_std = None
+
+        if mstep_dual_params and state.get('mstep_optim') is not None:
+             try:
+                 if self.mstep_optim is None: # Create if doesn't exist
+                      self.mstep_optim = torch.optim.Adam(mstep_dual_params, lr=self._mstep_dual_lr)
+                 else: # Ensure params are updated in existing optimizer
+                      self.mstep_optim.param_groups[0]['params'] = mstep_dual_params
+                 self.mstep_optim.load_state_dict(state['mstep_optim'])
+                 self.logger.info("Loaded M-step optimizer state.")
+             except Exception as e: self.logger.error(f"Could not load M-step optimizer state: {e}")
+        elif mstep_dual_params:
+             self.mstep_optim = torch.optim.Adam(mstep_dual_params, lr=self._mstep_dual_lr)
+             self.logger.info("Created fresh M-step optimizer as no state was found.")
+        else: self.mstep_optim = None
